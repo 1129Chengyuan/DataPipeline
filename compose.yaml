@@ -1,37 +1,27 @@
-version: '3.8'
-
 services:
-  postgres:
+  # The Database where our NBA data will live
+  db:
     image: postgres:15
-    restart: always
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: nba_stats
     ports:
       - "5432:5432"
-    environment:
-      POSTGRES_USER: admin
-      POSTGRES_PASSWORD: admin
-      POSTGRES_DB: etl_data
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    networks:
-      - etl_network
+      - ./data:/data  # Additional volume for easy file access
 
-  etl-app:
-    build: . # Tells Docker Compose to look for a local Dockerfile in the current directory
-    depends_on:
-      - postgres # Ensures the database starts before the ETL app
+  # A GUI to let you see your tables easily
+  pgadmin:
+    image: dpage/pgadmin4
     environment:
-      # Pass database credentials to the ETL script via environment variables
-      DB_HOST: postgres 
-      DB_NAME: etl_data
-      DB_USER: admin
-      DB_PASSWORD: admin
-    networks:
-      - etl_network
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "8080:80"
+    depends_on:
+      - db
 
 volumes:
   postgres_data:
-    driver: local
-
-networks:
-  etl_network:
-    driver: bridge
