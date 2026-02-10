@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    restart: always
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin
+      POSTGRES_DB: etl_data
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - etl_network
+
+  etl-app:
+    build: . # Tells Docker Compose to look for a local Dockerfile in the current directory
+    depends_on:
+      - postgres # Ensures the database starts before the ETL app
+    environment:
+      # Pass database credentials to the ETL script via environment variables
+      DB_HOST: postgres 
+      DB_NAME: etl_data
+      DB_USER: admin
+      DB_PASSWORD: admin
+    networks:
+      - etl_network
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  etl_network:
+    driver: bridge
