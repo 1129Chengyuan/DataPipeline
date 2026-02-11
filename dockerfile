@@ -1,29 +1,20 @@
+# Use an official Python runtime as a parent image
 FROM python:3.11-slim
-
-# Set working directory
-WORKDIR /app
-
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    gcc \
-    postgresql-client \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy requirements
-COPY requirements.txt .
-
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy application code
-COPY *.py .
-COPY config.py .
-
-# Create directories
-RUN mkdir -p /app/data/raw /app/data/processed /app/logs
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
 
-# Default command
-CMD ["python", "run_etl.py"]
+# Set the working directory in the container
+WORKDIR /app
+
+# Copy the requirements file into the container
+COPY requirements.txt .
+
+# Install any needed packages specified in requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the rest of the application code into the container
+COPY . .
+
+# Run etl_pipeline.py when the container launches
+CMD ["python", "etl_pipeline.py"]

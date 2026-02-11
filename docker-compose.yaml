@@ -1,0 +1,53 @@
+services:
+  pgdatabase:
+    image: postgres:16-alpine
+    container_name: postgres_db
+    restart: always
+    environment:
+      POSTGRES_USER: root
+      POSTGRES_PASSWORD: root
+      POSTGRES_DB: mydatabase
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432" # Allows local DB tools to connect
+    networks:
+      - postgres_net
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: pgadmin_ui
+    restart: always
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+      PGADMIN_DEFAULT_PASSWORD: root
+    volumes:
+      - pgadmin:/var/lib/pgadmin
+    ports:
+      - "8080:80"
+    networks:
+      - postgres_net
+    depends_on:
+      - pgdatabase
+
+  etl:
+    build: .
+    container_name: nba_etl
+    environment:
+      DB_USER: root
+      DB_PASS: root
+      DB_NAME: mydatabase
+      DB_HOST: pgdatabase
+      DB_PORT: 5432
+    networks:
+      - postgres_net
+    depends_on:
+      - pgdatabase
+
+networks:
+  postgres_net:
+    driver: bridge
+
+volumes:
+  pgdata:
+  pgadmin:
