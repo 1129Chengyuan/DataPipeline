@@ -43,6 +43,8 @@ services:
       - postgres_net
     depends_on:
       - pgdatabase
+    volumes:
+      - ./datalake/bronze:/app/datalake
 
 networks:
   postgres_net:
