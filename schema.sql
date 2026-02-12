@@ -1,27 +1,15 @@
--- 1. TEAMS
--- Reduced to exactly what is in the JSON. 
--- 'city' and 'nickname' are combined in 'team_name' and require parsing (Gold Layer).
--- 'year_founded' is removed as it is not in the source.
 CREATE TABLE teams (
     id INT PRIMARY KEY,
     abbreviation TEXT NOT NULL,
     team_name TEXT NOT NULL -- e.g., "Sacramento Kings"
 );
 
--- 2. GAMES
--- Removed 'home_team_id' and 'away_team_id'.
--- In this data source, you don't know the Opponent ID, only the Opponent Abbreviation (from Matchup).
--- Resolving IDs requires a lookup that belongs in the Gold Layer.
 CREATE TABLE games (
     game_id TEXT PRIMARY KEY,
     season_id INT NOT NULL,
     game_date DATE NOT NULL
-    -- Foreign keys removed for Silver to allow faster, decoupled loading
 );
 
--- 3. TEAM GAME STATS (The "Fact" Table)
--- Added 'matchup' here because it is specific to the team's perspective (e.g., "SAC @ NOP").
--- All stats remain 1:1 with the headers.
 CREATE TABLE team_game_stats (
     -- Composite Key: A specific team's stats for a specific game
     game_id TEXT,
@@ -61,3 +49,30 @@ CREATE TABLE team_game_stats (
     FOREIGN KEY (game_id) REFERENCES games(game_id),
     FOREIGN KEY (team_id) REFERENCES teams(id)
 );
+
+CREATE TABLE players (
+    player_id INT PRIMARY KEY,
+    first_name TEXT,
+    last_name TEXT,
+    is_active BOOLEAN
+);
+
+CREATE TABLE IF NOT EXISTS play_by_play (
+    game_id TEXT,
+    eventnum INT,
+    eventmsgtype INT,
+    period INT,
+    pctimestring TEXT,
+    homedescription TEXT,
+    visitordescription TEXT,
+    score TEXT,
+    player1_id INT,
+    player2_id INT,
+    player3_id INT,
+    PRIMARY KEY (game_id, eventnum)
+);
+
+-- Add index for fast "Clutch Time" lookups
+CREATE INDEX idx_pbp_game ON play_by_play(game_id);
+
+
