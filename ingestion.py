@@ -41,7 +41,7 @@ for team in all_teams:
 # now for the players
 os.makedirs(BRONZE_PATH + "/players", exist_ok = True)
 players_df = players.get_players()
-player_file = f"{BRONZE_PATH}/players.json"
+player_file = f"{BRONZE_PATH}/players/players.json"
 try:
     with open(player_file, "w") as f:
         json.dump(players_df, f)
