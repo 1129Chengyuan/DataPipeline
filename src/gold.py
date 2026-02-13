@@ -1,11 +1,16 @@
 """
 Gold Layer: Load Silver parquets into PostgreSQL fact/dimension tables.
 
+Usage:
+    python gold.py 2024-01-15          # Load one date's partitioned data
+    python gold.py 2024-01-15 --dims   # Also refresh dimension tables
+
 Uses staging-table upserts (INSERT ... ON CONFLICT DO UPDATE) so the
 script can be re-run safely without duplicating data.
 """
 
 import os
+import argparse
 import pandas as pd
 import numpy as np
 from sqlalchemy import create_engine, text
@@ -22,7 +27,7 @@ engine = create_engine(
     f"postgresql://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}"
 )
 
-SILVER_PATH = "/app/datalake/silver"
+SILVER_PATH = os.getenv("SILVER_PATH", "/app/datalake/silver")
 
 
 # ── Schema initializer ───────────────────────────────────────────────
@@ -130,6 +135,28 @@ def init_schema():
         conn.execute(text(SCHEMA_SQL))
     print("✔ Schema verified")
 
+
+# ── Season helper ────────────────────────────────────────────────────
+
+def get_nba_season(game_date: str) -> int:
+    """Derive NBA season year from a game date (Oct+ = year, else year-1)."""
+    from datetime import datetime
+    dt = datetime.strptime(game_date, "%Y-%m-%d")
+    return dt.year if dt.month >= 10 else dt.year - 1
+
+
+# ── Partitioned Silver reader ────────────────────────────────────────
+
+def read_silver_partition(dataset: str, game_date: str) -> pd.DataFrame:
+    """Read a single date's Silver partition for a dataset."""
+    season = get_nba_season(game_date)
+    path = f"{SILVER_PATH}/{dataset}/season={season}/game_date={game_date}/data.parquet"
+    if not os.path.exists(path):
+        print(f"  ⚠ No Silver data at {path}")
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
 # ── Upsert helper ────────────────────────────────────────────────────
 
 def upsert(df: pd.DataFrame, table_name: str, primary_keys: list[str]):
@@ -142,13 +169,9 @@ def upsert(df: pd.DataFrame, table_name: str, primary_keys: list[str]):
     staging = f"_staging_{table_name}"
 
     with engine.begin() as conn:
-        # Drop leftover staging table
         conn.execute(text(f"DROP TABLE IF EXISTS {staging}"))
-
-        # Write to staging
         df.to_sql(staging, conn, if_exists="replace", index=False, method="multi")
 
-        # Build column lists
         all_cols = [c for c in df.columns]
         pk_clause = ", ".join(primary_keys)
         non_pk_cols = [c for c in all_cols if c not in primary_keys]
@@ -157,9 +180,7 @@ def upsert(df: pd.DataFrame, table_name: str, primary_keys: list[str]):
         select_cols = ", ".join(all_cols)
 
         if non_pk_cols:
-            update_set = ", ".join(
-                f"{c} = EXCLUDED.{c}" for c in non_pk_cols
-            )
+            update_set = ", ".join(f"{c} = EXCLUDED.{c}" for c in non_pk_cols)
             conflict = f"ON CONFLICT ({pk_clause}) DO UPDATE SET {update_set}"
         else:
             conflict = f"ON CONFLICT ({pk_clause}) DO NOTHING"
@@ -175,29 +196,23 @@ def upsert(df: pd.DataFrame, table_name: str, primary_keys: list[str]):
     return result.rowcount
 
 
-# ── Dimension loaders ────────────────────────────────────────────────
+# ── Dimension loaders (unpartitioned) ────────────────────────────────
 
 def load_dim_players():
     """Silver players → players dimension table."""
     print("Loading dimension: players...")
     df = pd.read_parquet(f"{SILVER_PATH}/players/players.parquet")
-
     df = df.rename(columns={"id": "player_id"})
     df = df[["player_id", "first_name", "last_name", "is_active"]]
     df = df.drop_duplicates(subset=["player_id"])
-
     count = upsert(df, "players", ["player_id"])
     print(f"  ✔ {count} rows upserted into players")
 
 
 def load_dim_teams():
-    """
-    Silver team game logs → teams dimension table.
-    Extracts unique (TEAM_ID, TEAM_ABBREVIATION, TEAM_NAME) tuples.
-    """
+    """Silver teams → teams dimension table."""
     print("Loading dimension: teams...")
-    df = pd.read_parquet(f"{SILVER_PATH}/teams/team_game_logs.parquet")
-
+    df = pd.read_parquet(f"{SILVER_PATH}/teams/teams.parquet")
     teams_df = (
         df[["TEAM_ID", "TEAM_ABBREVIATION", "TEAM_NAME"]]
         .drop_duplicates(subset=["TEAM_ID"])
@@ -207,19 +222,14 @@ def load_dim_teams():
             "TEAM_NAME": "team_name",
         })
     )
-
     count = upsert(teams_df, "teams", ["id"])
     print(f"  ✔ {count} rows upserted into teams")
 
 
 def load_dim_games():
-    """
-    Silver team game logs → games dimension table.
-    Extracts unique (GAME_ID, SEASON_ID, GAME_DATE) tuples.
-    """
+    """Silver teams → games dimension table (derives games from team logs)."""
     print("Loading dimension: games...")
-    df = pd.read_parquet(f"{SILVER_PATH}/teams/team_game_logs.parquet")
-
+    df = pd.read_parquet(f"{SILVER_PATH}/teams/teams.parquet")
     games_df = (
         df[["GAME_ID", "SEASON_ID", "GAME_DATE"]]
         .drop_duplicates(subset=["GAME_ID"])
@@ -229,53 +239,14 @@ def load_dim_games():
             "GAME_DATE": "game_date",
         })
     )
-    # season_id is stored as string like "22024" → extract last 4 digits as int
     games_df["season_id"] = (
-        games_df["season_id"]
-        .astype(str)
-        .str[-4:]
-        .astype(int)
+        games_df["season_id"].astype(str).str[-4:].astype(int)
     )
-
     count = upsert(games_df, "games", ["game_id"])
     print(f"  ✔ {count} rows upserted into games")
 
 
-# ── Fact loaders ─────────────────────────────────────────────────────
-
-def load_fact_team_stats():
-    """
-    Silver team game logs → fact_team_stats.
-    The Silver file already has traditional stats. We don't have per-team
-    advanced stats yet, so off_rating/def_rating/net_rating/pace are NULL
-    for now (they'd come from a team-level boxscore endpoint).
-    """
-    print("Loading fact: team_stats...")
-    df = pd.read_parquet(f"{SILVER_PATH}/teams/team_game_logs.parquet")
-
-    gold = df.rename(columns={
-        "GAME_ID": "game_id",
-        "TEAM_ID": "team_id",
-        "MATCHUP": "matchup",
-        "WL": "wl",
-        "MIN": "minutes",
-        "PTS": "pts",
-        "PLUS_MINUS": "plus_minus",
-    })
-
-    gold = gold[["game_id", "team_id", "matchup", "wl",
-                  "minutes", "pts", "plus_minus"]]
-
-    # Cast numeric types — use round() to handle float values before int cast
-    gold["pts"] = pd.to_numeric(gold["pts"], errors="coerce")
-    gold["plus_minus"] = pd.to_numeric(gold["plus_minus"], errors="coerce")
-    gold["minutes"] = pd.to_numeric(gold["minutes"], errors="coerce")
-
-    gold = gold.drop_duplicates(subset=["game_id", "team_id"])
-
-    count = upsert(gold, "fact_team_stats", ["game_id", "team_id"])
-    print(f"  ✔ {count} rows upserted into fact_team_stats")
-
+# ── Fact loaders (date-partitioned) ──────────────────────────────────
 
 def _parse_minutes_str(m):
     """Convert '12:34' or 'PT12M34.00S' to decimal minutes like 12.57."""
@@ -283,26 +254,25 @@ def _parse_minutes_str(m):
         return None
     s = str(m)
     try:
-        # Handle "MM:SS" format
         if ":" in s and "PT" not in s:
             parts = s.split(":")
             return round(float(parts[0]) + float(parts[1]) / 60, 2)
-        # Handle "PT12M34.00S" format
         if s.startswith("PT"):
-            s = s[2:]  # strip PT
+            s = s[2:]
             mins, rest = s.split("M")
             secs = rest.rstrip("S")
             return round(float(mins) + float(secs) / 60, 2)
-        # Try direct float
         return round(float(s), 2)
     except (ValueError, AttributeError):
         return None
 
 
-def load_fact_player_stats():
-    """Silver boxscores (V3 advanced) → fact_player_stats."""
-    print("Loading fact: player_stats...")
-    df = pd.read_parquet(f"{SILVER_PATH}/boxscores/boxscores.parquet")
+def load_fact_player_stats(game_date: str):
+    """Silver boxscores partition → fact_player_stats."""
+    print(f"Loading fact: player_stats ({game_date})...")
+    df = read_silver_partition("boxscores", game_date)
+    if df.empty:
+        return
 
     gold = df.rename(columns={
         "GAME_ID": "game_id",
@@ -324,14 +294,10 @@ def load_fact_player_stats():
             "minutes", "off_rating", "def_rating", "net_rating",
             "usg_pct", "ts_pct", "efg_pct", "pie"]
     gold = gold[cols]
-
-    # Parse minutes string → decimal
     gold["minutes"] = gold["minutes"].apply(_parse_minutes_str)
-
     gold = gold.drop_duplicates(subset=["game_id", "player_id"])
 
-    # Filter to only players/games that exist in dimension tables
-    # (avoids FK violations for old games without dimension entries)
+    # FK filter
     with engine.connect() as conn:
         existing_games = set(
             r[0] for r in conn.execute(text("SELECT game_id FROM games")).fetchall()
@@ -339,7 +305,6 @@ def load_fact_player_stats():
         existing_players = set(
             r[0] for r in conn.execute(text("SELECT player_id FROM players")).fetchall()
         )
-
     before = len(gold)
     gold = gold[
         gold["game_id"].isin(existing_games) &
@@ -347,20 +312,21 @@ def load_fact_player_stats():
     ]
     skipped = before - len(gold)
     if skipped:
-        print(f"  ⚠ Skipped {skipped} rows (missing FK refs in games/players)")
-
+        print(f"  ⚠ Skipped {skipped} rows (missing FK refs)")
     if gold.empty:
-        print("  ⚠ No rows to load after FK filter.")
+        print("  ⚠ No rows after FK filter.")
         return
 
     count = upsert(gold, "fact_player_stats", ["game_id", "player_id"])
     print(f"  ✔ {count} rows upserted into fact_player_stats")
 
 
-def load_fact_pbp():
-    """Silver play-by-play → fact_play_by_play."""
-    print("Loading fact: play_by_play...")
-    df = pd.read_parquet(f"{SILVER_PATH}/pbp/pbp.parquet")
+def load_fact_pbp(game_date: str):
+    """Silver PBP partition → fact_play_by_play."""
+    print(f"Loading fact: play_by_play ({game_date})...")
+    df = read_silver_partition("pbp", game_date)
+    if df.empty:
+        return
 
     gold = df.rename(columns={
         "GAME_ID": "game_id",
@@ -383,14 +349,11 @@ def load_fact_pbp():
             "description", "shot_distance", "score_home", "score_away",
             "is_field_goal"]
     gold = gold[cols]
-
-    # Replace 0 team/player IDs with NULL (0 means "no team/player" in V3)
     gold["team_id"] = gold["team_id"].replace(0, None)
     gold["player_id"] = gold["player_id"].replace(0, None)
-
     gold = gold.drop_duplicates(subset=["game_id", "action_number"])
 
-    # Filter to games that exist
+    # FK filter
     with engine.connect() as conn:
         existing_games = set(
             r[0] for r in conn.execute(text("SELECT game_id FROM games")).fetchall()
@@ -399,8 +362,7 @@ def load_fact_pbp():
     gold = gold[gold["game_id"].isin(existing_games)]
     skipped = before - len(gold)
     if skipped:
-        print(f"  ⚠ Skipped {skipped} rows (game_id not in games dimension)")
-
+        print(f"  ⚠ Skipped {skipped} rows (game_id not in games)")
     if gold.empty:
         print("  ⚠ No rows to load.")
         return
@@ -409,10 +371,12 @@ def load_fact_pbp():
     print(f"  ✔ {count} rows upserted into fact_play_by_play")
 
 
-def load_fact_shots():
-    """Silver shot charts → fact_shots."""
-    print("Loading fact: shots...")
-    df = pd.read_parquet(f"{SILVER_PATH}/shot_chart/shot_charts.parquet")
+def load_fact_shots(game_date: str):
+    """Silver shot charts partition → fact_shots."""
+    print(f"Loading fact: shots ({game_date})...")
+    df = read_silver_partition("shot_chart", game_date)
+    if df.empty:
+        return
 
     gold = df.rename(columns={
         "GAME_ID": "game_id",
@@ -435,10 +399,9 @@ def load_fact_shots():
             "shot_attempted_flag", "shot_made_flag",
             "shot_zone_basic", "shot_zone_area", "shot_zone_range"]
     gold = gold[cols]
-
     gold = gold.drop_duplicates(subset=["game_id", "game_event_id"])
 
-    # Filter to existing games + players
+    # FK filter
     with engine.connect() as conn:
         existing_games = set(
             r[0] for r in conn.execute(text("SELECT game_id FROM games")).fetchall()
@@ -446,7 +409,6 @@ def load_fact_shots():
         existing_players = set(
             r[0] for r in conn.execute(text("SELECT player_id FROM players")).fetchall()
         )
-
     before = len(gold)
     gold = gold[
         gold["game_id"].isin(existing_games) &
@@ -455,7 +417,6 @@ def load_fact_shots():
     skipped = before - len(gold)
     if skipped:
         print(f"  ⚠ Skipped {skipped} rows (missing FK refs)")
-
     if gold.empty:
         print("  ⚠ No rows to load.")
         return
@@ -464,28 +425,95 @@ def load_fact_shots():
     print(f"  ✔ {count} rows upserted into fact_shots")
 
 
-# ── Main ─────────────────────────────────────────────────────────────
+# ── Bulk fact loaders (from unpartitioned files) ─────────────────────
+
+def load_fact_team_stats():
+    """
+    Silver teams (unpartitioned) → fact_team_stats.
+    Team game logs span all history, so this runs with --dims.
+    """
+    print("Loading fact: team_stats (all history)...")
+    df = pd.read_parquet(f"{SILVER_PATH}/teams/teams.parquet")
+
+    gold = df.rename(columns={
+        "GAME_ID": "game_id",
+        "TEAM_ID": "team_id",
+        "MATCHUP": "matchup",
+        "WL": "wl",
+        "MIN": "minutes",
+        "PTS": "pts",
+        "PLUS_MINUS": "plus_minus",
+    })
+
+    gold = gold[["game_id", "team_id", "matchup", "wl",
+                  "minutes", "pts", "plus_minus"]]
+
+    gold["pts"] = pd.to_numeric(gold["pts"], errors="coerce")
+    gold["plus_minus"] = pd.to_numeric(gold["plus_minus"], errors="coerce")
+    gold["minutes"] = pd.to_numeric(gold["minutes"], errors="coerce")
+    gold = gold.drop_duplicates(subset=["game_id", "team_id"])
+
+    # FK filter: only load rows whose game_id exists
+    with engine.connect() as conn:
+        existing_games = set(
+            r[0] for r in conn.execute(text("SELECT game_id FROM games")).fetchall()
+        )
+    before = len(gold)
+    gold = gold[gold["game_id"].isin(existing_games)]
+    skipped = before - len(gold)
+    if skipped:
+        print(f"  ⚠ Skipped {skipped} rows (game_id not in games)")
+
+    if gold.empty:
+        print("  ⚠ No rows to load.")
+        return
+
+    count = upsert(gold, "fact_team_stats", ["game_id", "team_id"])
+    print(f"  ✔ {count} rows upserted into fact_team_stats")
+
+
+# ── Date-based orchestration ─────────────────────────────────────────
+
+def load_date(game_date: str):
+    """Load all fact tables for a single date's Silver partitions."""
+    load_fact_player_stats(game_date)
+    load_fact_pbp(game_date)
+    load_fact_shots(game_date)
+
+
+# ── CLI ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Load Silver Parquet partitions → PostgreSQL for a date."
+    )
+    parser.add_argument(
+        "game_date",
+        help="Date to load in YYYY-MM-DD format (e.g. 2024-01-15)",
+    )
+    parser.add_argument(
+        "--dims",
+        action="store_true",
+        help="Also load dimension tables (teams, players, games) + "
+             "team_stats fact table. Needed on first run or periodically.",
+    )
+    args = parser.parse_args()
+
     print("=" * 50)
-    print("Gold Layer: Silver → PostgreSQL")
+    print(f"Gold Layer: {args.game_date} → PostgreSQL")
     print("=" * 50)
 
-    # Schema first
     init_schema()
 
-    # Dimensions FIRST (facts reference them via FK)
-    load_dim_teams()
-    load_dim_players()
-    load_dim_games()
+    if args.dims:
+        load_dim_teams()
+        load_dim_players()
+        load_dim_games()
+        load_fact_team_stats()
 
-    # Facts
-    load_fact_team_stats()
-    load_fact_player_stats()
-    load_fact_pbp()
-    load_fact_shots()
+    load_date(args.game_date)
 
     print()
     print("=" * 50)
-    print("Done! All tables loaded.")
+    print("Done!")
     print("=" * 50)
