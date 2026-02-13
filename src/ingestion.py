@@ -1,137 +1,204 @@
+"""
+Bronze Layer Ingestion: Download raw NBA data for a single date.
+
+Usage:
+    python ingestion.py 2024-01-15          # Ingest all games on that date
+    python ingestion.py 2024-01-15 --dims   # Also refresh dimension tables (teams/players)
+
+Designed for Airflow: each DAG run calls this with one date, enabling
+parallel backfills across an entire season.
+"""
+
 import os
-import pandas as pd
+import sys
 import json
 import time
+import argparse
 from nba_api.stats.static import teams, players
-from nba_api.stats.endpoints import leaguegamefinder, shotchartdetail, boxscoreadvancedv3, playbyplayv3
+from nba_api.stats.endpoints import (
+    scoreboardv2,
+    shotchartdetail,
+    boxscoreadvancedv3,
+    playbyplayv3,
+)
 
-# First create the folders
-BRONZE_PATH = "/app/datalake/bronze"
+BRONZE_PATH = os.getenv("BRONZE_PATH", "/app/datalake/bronze")
+RATE_LIMIT = 0.600  # seconds between API calls
+
 for folder in ["teams", "players", "pbp", "boxscores", "shot_chart"]:
     os.makedirs(f"{BRONZE_PATH}/{folder}", exist_ok=True)
 
-def get_all_teams():
-    all_teams = teams.get_teams()
-    for team in all_teams:
-        team_id = team['id']
-        team_name = team['full_name']
 
-        team_file = f"{BRONZE_PATH}/teams/{team_id}.json"
+# ── Helpers ──────────────────────────────────────────────────────────
 
-        if os.path.exists(team_file):
-            print(f"{team_name} already downloaded.")
-            continue
-        print(f"Downloading history for {team_name}")
+def _save_json(data: dict, path: str):
+    """Write JSON to disk."""
+    with open(path, "w") as f:
+        json.dump(data, f)
 
-        try:
-            game_finder = leaguegamefinder.LeagueGameFinder(team_id_nullable = team_id)
-            data = game_finder.get_dict()
-            with open(team_file, "w") as f:
-                json.dump(data, f)
-            print(f"Saved {team_name} successfully.") 
-            time.sleep(0.600)
-        except Exception as e:
-            print(f"Failed to download {team_name}: {e}")
-    return all_teams
 
-def get_all_players():
-    unique_game_ids = set()
-    players_df = players.get_players()
-    player_file = f"{BRONZE_PATH}/players/players.json"
+def _already_exists(path: str) -> bool:
+    """Check if a file already exists (skip re-downloads)."""
+    return os.path.exists(path)
+
+
+# ── Date-based game discovery ────────────────────────────────────────
+
+def get_game_ids_for_date(game_date: str) -> list[str]:
+    """
+    Use ScoreboardV2 to find all game IDs played on a specific date.
+
+    Args:
+        game_date: Date string in 'YYYY-MM-DD' format.
+
+    Returns:
+        List of game_id strings, e.g. ['0022300555', '0022300556', ...]
+    """
+    print(f"Looking up games on {game_date}...")
+    sb = scoreboardv2.ScoreboardV2(game_date=game_date)
+    data = sb.get_dict()
+
+    game_header = [
+        rs for rs in data["resultSets"] if rs["name"] == "GameHeader"
+    ][0]
+
+    headers = game_header["headers"]
+    gi_idx = headers.index("GAME_ID")
+    game_ids = [row[gi_idx] for row in game_header["rowSet"]]
+
+    print(f"  Found {len(game_ids)} games on {game_date}")
+    return game_ids
+
+
+# ── Per-game downloaders ─────────────────────────────────────────────
+
+def download_boxscore(game_id: str):
+    """Download advanced boxscore (V3) for a single game."""
+    path = f"{BRONZE_PATH}/boxscores/{game_id}.json"
+    if _already_exists(path):
+        return
     try:
-        with open(player_file, "w") as f:
-            json.dump(players_df, f)
-        print(f"Saved players successfully.")
+        data = boxscoreadvancedv3.BoxScoreAdvancedV3(game_id=game_id).get_dict()
+        _save_json(data, path)
+        print(f"  ✔ boxscore {game_id}")
+        time.sleep(RATE_LIMIT)
     except Exception as e:
-        print(f"Failed to download players: {e}")
+        print(f"  ✘ boxscore {game_id}: {e}")
 
-def get_playbyplay(unique_game_ids):
-    for game_id in unique_game_ids:
-        pbp_file = f"{BRONZE_PATH}/pbp/{game_id}.json"
-        if os.path.exists(pbp_file):
-            print(f"PBP for game {game_id} already downloaded.")
+
+def download_pbp(game_id: str):
+    """Download play-by-play (V3) for a single game."""
+    path = f"{BRONZE_PATH}/pbp/{game_id}.json"
+    if _already_exists(path):
+        return
+    try:
+        data = playbyplayv3.PlayByPlayV3(game_id=game_id).get_dict()
+        _save_json(data, path)
+        print(f"  ✔ pbp     {game_id}")
+        time.sleep(RATE_LIMIT)
+    except Exception as e:
+        print(f"  ✘ pbp     {game_id}: {e}")
+
+
+def download_shotchart(game_id: str):
+    """Download shot chart for a single game."""
+    path = f"{BRONZE_PATH}/shot_chart/{game_id}.json"
+    if _already_exists(path):
+        return
+    try:
+        data = shotchartdetail.ShotChartDetail(
+            team_id=0,
+            player_id=0,
+            game_id_nullable=game_id,
+            context_measure_simple="FGA",
+        ).get_dict()
+        _save_json(data, path)
+        print(f"  ✔ shots   {game_id}")
+        time.sleep(RATE_LIMIT)
+    except Exception as e:
+        print(f"  ✘ shots   {game_id}: {e}")
+
+
+# ── Dimension downloaders (run once / infrequently) ──────────────────
+
+def download_all_teams():
+    """Download full game history for all 30 teams."""
+    from nba_api.stats.endpoints import leaguegamefinder
+
+    print("Downloading team histories...")
+    for team in teams.get_teams():
+        team_id = team["id"]
+        path = f"{BRONZE_PATH}/teams/{team_id}.json"
+        if _already_exists(path):
             continue
-        print(f"Downloading play-by-play for game {game_id}")
         try:
-            pbp = playbyplayv3.PlayByPlayV3(game_id=game_id)
-            data = pbp.get_dict()
-            with open(pbp_file, "w") as f:
-                json.dump(data, f)
-            print(f"Saved play-by-play for game {game_id} successfully.")
-            time.sleep(0.600)
+            data = leaguegamefinder.LeagueGameFinder(
+                team_id_nullable=team_id
+            ).get_dict()
+            _save_json(data, path)
+            print(f"  ✔ {team['full_name']}")
+            time.sleep(RATE_LIMIT)
         except Exception as e:
-            print(f"Failed to download play-by-play for game {game_id}: {e}")
+            print(f"  ✘ {team['full_name']}: {e}")
 
 
-def get_games(all_teams) -> set:
-    unique_game_ids = set()
-    
-    team_files = os.listdir(f"{BRONZE_PATH}/teams")
-    
-    for filename in team_files:
-        if not filename.endswith(".json"): continue
-        
-        file_path = f"{BRONZE_PATH}/teams/{filename}"
-        
-        try:
-            with open(file_path, "r") as f:
-                data = json.load(f)
-            
-            if 'resultSets' in data and len(data['resultSets']) > 0:
-                headers = data['resultSets'][0]['headers']
-                rows = data['resultSets'][0]['rowSet']
-                if 'GAME_ID' in headers:
-                    idx = headers.index('GAME_ID')
-                    for row in rows:
-                        unique_game_ids.add(row[idx])
-        except Exception as e:
-            print(f"Error reading {filename}: {e}")
-            
-    print(f"Found {len(unique_game_ids)} unique games in history.")
-    return unique_game_ids
+def download_all_players():
+    """Download static player list."""
+    path = f"{BRONZE_PATH}/players/players.json"
+    try:
+        _save_json(players.get_players(), path)
+        print("  ✔ players")
+    except Exception as e:
+        print(f"  ✘ players: {e}")
 
-def get_boxscores(unique_game_ids):
-    for game_id in unique_game_ids:
-        boxscore_file = f"{BRONZE_PATH}/boxscores/{game_id}.json"
-        if os.path.exists(boxscore_file):
-            print(f"Boxscore for game {game_id} already downloaded.")
-            continue
-        print(f"Downloading boxscore for game {game_id}")
-        try:
-            boxscore = boxscoreadvancedv3.BoxScoreAdvancedV3(game_id=game_id)
-            data = boxscore.get_dict()
-            with open(boxscore_file, "w") as f:
-                json.dump(data, f)
-            print(f"Saved boxscore for game {game_id} successfully.")
-            time.sleep(0.600)
-        except Exception as e:
-            print(f"Failed to download boxscore for game {game_id}: {e}")
 
-def get_shotcharts(unique_game_ids):
-    for game_id in unique_game_ids:
-        shotchart_file = f"{BRONZE_PATH}/shot_chart/{game_id}.json"
-        if not os.path.exists(shotchart_file):
-            try:
-                shotchart = shotchartdetail.ShotChartDetail(
-                    team_id=0,
-                    player_id=0,
-                    game_id_nullable=game_id,
-                    context_measure_simple='FGA')
-                data = shotchart.get_dict()
-                with open(shotchart_file, "w") as f:
-                    json.dump(data, f)
-                print(f"Saved shotchart for {game_id} successfully.")
-                time.sleep(0.600)
-            except Exception as e:
-                print(f"Failed to download shotchart for game {game_id}: {e}")
+# ── Orchestration ────────────────────────────────────────────────────
+
+def ingest_date(game_date: str):
+    """
+    Full ingestion for one date:
+      1. Look up game IDs via ScoreboardV2
+      2. Download boxscores, PBP, and shot charts for each game
+    """
+    game_ids = get_game_ids_for_date(game_date)
+
+    if not game_ids:
+        print(f"  No games on {game_date}, nothing to do.")
+        return
+
+    print(f"Downloading data for {len(game_ids)} games...")
+    for gid in game_ids:
+        download_boxscore(gid)
+        download_pbp(gid)
+        download_shotchart(gid)
+
+    print(f"✔ Done ingesting {game_date} ({len(game_ids)} games)")
+
+
+# ── CLI ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    all_teams = get_all_teams()
-    unique_game_ids = get_games(all_teams)
-    # just test with 5 games first
-    recent_games = [gid for gid in unique_game_ids if gid.startswith('002')]
-    unique_game_ids = recent_games[-10:]
-    get_boxscores(unique_game_ids)
-    get_shotcharts(unique_game_ids)
-    get_playbyplay(unique_game_ids)
-    get_all_players()
+    parser = argparse.ArgumentParser(
+        description="Ingest NBA data for a specific date into Bronze layer."
+    )
+    parser.add_argument(
+        "game_date",
+        help="Date to ingest in YYYY-MM-DD format (e.g. 2024-01-15)",
+    )
+    parser.add_argument(
+        "--dims",
+        action="store_true",
+        help="Also download dimension tables (teams + players). "
+             "Only needed on first run or periodically.",
+    )
+    args = parser.parse_args()
+
+    print("=" * 50)
+    print(f"Bronze Ingestion: {args.game_date}")
+    print("=" * 50)
+
+    if args.dims:
+        download_all_teams()
+        download_all_players()
+
+    ingest_date(args.game_date)
