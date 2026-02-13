@@ -1,83 +1,140 @@
-import os 
-import pandas as pd
+"""
+Silver Layer: Transform Bronze JSON → partitioned Silver Parquet.
+
+Usage:
+    python data_extraction.py 2024-01-15          # Process one date's games
+    python data_extraction.py 2024-01-15 --dims   # Also refresh dimension tables
+
+Output structure:
+    silver/boxscores/season=2023/game_date=2024-01-15/data.parquet
+    silver/pbp/season=2023/game_date=2024-01-15/data.parquet
+    silver/shot_chart/season=2023/game_date=2024-01-15/data.parquet
+    silver/players/players.parquet       (unpartitioned dimension)
+    silver/teams/teams.parquet           (unpartitioned dimension)
+"""
+
+import os
 import json
-import glob
+import argparse
+import pandas as pd
 
-BRONZE_PATH = "/app/datalake/bronze"
-SILVER_PATH = "/app/datalake/silver"
+BRONZE_PATH = os.getenv("BRONZE_PATH", "/app/datalake/bronze")
+SILVER_PATH = os.getenv("SILVER_PATH", "/app/datalake/silver")
 
-for folder in ["teams", "players", "pbp", "boxscores", "shot_chart"]:
-    os.makedirs(f"{SILVER_PATH}/{folder}", exist_ok=True)
+
+# ── Season helper ────────────────────────────────────────────────────
+
+def get_nba_season(game_date: str) -> int:
+    """
+    Derive NBA season year from a game date.
+    NBA seasons run Oct → June, so:
+      2024-01-15 → season 2023  (2023-24 season)
+      2024-10-22 → season 2024  (2024-25 season)
+    """
+    from datetime import datetime
+    dt = datetime.strptime(game_date, "%Y-%m-%d")
+    return dt.year if dt.month >= 10 else dt.year - 1
+
+
+# ── Manifest reader ──────────────────────────────────────────────────
+
+def load_manifest(game_date: str) -> list[str]:
+    """Read the manifest created by ingestion.py for this date."""
+    manifest_path = f"{BRONZE_PATH}/manifests/{game_date}.json"
+    if not os.path.exists(manifest_path):
+        raise FileNotFoundError(
+            f"No manifest found at {manifest_path}. "
+            f"Run ingestion.py {game_date} first."
+        )
+    with open(manifest_path, "r") as f:
+        data = json.load(f)
+    return data["game_ids"]
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
 def get_game_id_from_filename(file_path):
     """Extracts '0022300001' from '/.../0022300001.json'"""
-    return os.path.basename(file_path).replace('.json', '')
+    return os.path.basename(file_path).replace(".json", "")
 
 
-# ── Converters ───────────────────────────────────────────────────────
-
-def convert_players_pd() -> pd.DataFrame:
-    """Load the players JSON list and return a cleaned DataFrame."""
-    file_path = f"{BRONZE_PATH}/players/players.json"
-    with open(file_path, 'r') as f:
-        data = json.load(f)        # list of dicts
-
-    df = pd.DataFrame(data)
-
-    # ── Type casting ──
-    df['id'] = df['id'].astype(int)
-    df['is_active'] = df['is_active'].astype(bool)
-    df['full_name'] = df['full_name'].astype(str).str.strip()
-    df['first_name'] = df['first_name'].astype(str).str.strip()
-    df['last_name'] = df['last_name'].astype(str).str.strip()
-
-    # ── Deduplication ──
-    df = df.drop_duplicates(subset=['id'])
-
-    return df
+def save_partitioned(df: pd.DataFrame, dataset: str, season: int, game_date: str):
+    """Save a DataFrame to a partitioned Parquet path."""
+    out_dir = f"{SILVER_PATH}/{dataset}/season={season}/game_date={game_date}"
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = f"{out_dir}/data.parquet"
+    df.to_parquet(out_path, index=False)
+    print(f"  ✔ {out_path} ({len(df)} rows)")
 
 
-def convert_teams_pd(file_path: str) -> pd.DataFrame:
-    """Convert a single team game-log JSON (resultSets format) to DataFrame."""
-    with open(file_path, 'r') as f:
+# ── Converters (unchanged logic, per-file) ───────────────────────────
+
+def convert_boxscore(file_path: str) -> pd.DataFrame:
+    """Convert a V3 advanced boxscore JSON to a flat DataFrame of player stats."""
+    game_id = get_game_id_from_filename(file_path)
+
+    with open(file_path, "r") as f:
         data = json.load(f)
 
-    headers = data['resultSets'][0]['headers']
-    rows = data['resultSets'][0]['rowSet']
-    df = pd.DataFrame(rows, columns=headers)
+    try:
+        bs = data["boxScoreAdvanced"]
+    except (KeyError, TypeError):
+        print(f"  ⚠ No boxScoreAdvanced in {file_path}, skipping.")
+        return pd.DataFrame()
 
-    # ── Type casting ──
-    df['TEAM_ID'] = df['TEAM_ID'].astype(int)
-    df['PTS'] = pd.to_numeric(df['PTS'], errors='coerce').astype('Int64')
-    df['PLUS_MINUS'] = pd.to_numeric(df['PLUS_MINUS'], errors='coerce')
-    for col in ['FG_PCT', 'FG3_PCT', 'FT_PCT']:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-    for col in ['FGM', 'FGA', 'FG3M', 'FG3A', 'FTM', 'FTA',
-                'OREB', 'DREB', 'REB', 'AST', 'STL', 'BLK', 'TOV', 'PF']:
-        df[col] = pd.to_numeric(df[col], errors='coerce').astype('Int64')
+    all_players = []
+    for team_type in ["homeTeam", "awayTeam"]:
+        team_data = bs.get(team_type, {})
+        team_id = team_data.get("teamId")
+        team_tricode = team_data.get("teamTricode", "")
 
-    # ── Date formatting ──
-    df['GAME_DATE'] = pd.to_datetime(df['GAME_DATE'], errors='coerce')
+        for player in team_data.get("players", []):
+            row = {
+                "PERSON_ID": player.get("personId"),
+                "FIRST_NAME": player.get("firstName", ""),
+                "FAMILY_NAME": player.get("familyName", ""),
+                "NAME_I": player.get("nameI", ""),
+                "POSITION": player.get("position", ""),
+                "COMMENT": player.get("comment", ""),
+                "JERSEY_NUM": player.get("jerseyNum", ""),
+                "TEAM_ID": team_id,
+                "TEAM_TRICODE": team_tricode,
+                "TEAM_TYPE": "HOME" if team_type == "homeTeam" else "AWAY",
+            }
+            stats = player.get("statistics", {})
+            for stat_key, stat_val in stats.items():
+                row[stat_key] = stat_val
+            all_players.append(row)
 
-    # ── Deduplication ──
-    df = df.drop_duplicates(subset=['GAME_ID', 'TEAM_ID'])
+    if not all_players:
+        return pd.DataFrame()
 
+    df = pd.DataFrame(all_players)
+    df["GAME_ID"] = game_id
+
+    # Type casting
+    df["PERSON_ID"] = pd.to_numeric(df["PERSON_ID"], errors="coerce").astype("Int64")
+    df["TEAM_ID"] = pd.to_numeric(df["TEAM_ID"], errors="coerce").astype("Int64")
+    stat_cols = [c for c in df.columns if c not in (
+        "GAME_ID", "PERSON_ID", "FIRST_NAME", "FAMILY_NAME", "NAME_I",
+        "POSITION", "COMMENT", "JERSEY_NUM", "TEAM_ID", "TEAM_TRICODE",
+        "TEAM_TYPE", "minutes")]
+    for col in stat_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.drop_duplicates(subset=["GAME_ID", "PERSON_ID"])
     return df
 
 
-def convert_pbp_pd(file_path: str) -> pd.DataFrame:
+def convert_pbp(file_path: str) -> pd.DataFrame:
     """Convert a V3 play-by-play JSON to DataFrame."""
     game_id = get_game_id_from_filename(file_path)
 
-    with open(file_path, 'r') as f:
+    with open(file_path, "r") as f:
         data = json.load(f)
 
-    # V3 structure: data['game']['actions']
     try:
-        actions = data['game']['actions']
+        actions = data["game"]["actions"]
     except (KeyError, TypeError):
         print(f"  ⚠ No actions in {file_path}, skipping.")
         return pd.DataFrame()
@@ -86,259 +143,216 @@ def convert_pbp_pd(file_path: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = pd.DataFrame(actions)
+    df["GAME_ID"] = game_id
 
-    # ── Inject Game ID ──
-    df['GAME_ID'] = game_id
+    # Type casting
+    df["period"] = pd.to_numeric(df["period"], errors="coerce").astype("Int64")
+    df["teamId"] = pd.to_numeric(df["teamId"], errors="coerce").astype("Int64")
+    df["personId"] = pd.to_numeric(df["personId"], errors="coerce").astype("Int64")
+    df["shotDistance"] = pd.to_numeric(df["shotDistance"], errors="coerce")
+    df["isFieldGoal"] = df["isFieldGoal"].astype(bool)
+    df["scoreHome"] = pd.to_numeric(df["scoreHome"], errors="coerce").astype("Int64")
+    df["scoreAway"] = pd.to_numeric(df["scoreAway"], errors="coerce").astype("Int64")
 
-    # ── Type casting ──
-    df['period'] = pd.to_numeric(df['period'], errors='coerce').astype('Int64')
-    df['teamId'] = pd.to_numeric(df['teamId'], errors='coerce').astype('Int64')
-    df['personId'] = pd.to_numeric(df['personId'], errors='coerce').astype('Int64')
-    df['shotDistance'] = pd.to_numeric(df['shotDistance'], errors='coerce')
-    df['isFieldGoal'] = df['isFieldGoal'].astype(bool)
-    df['scoreHome'] = pd.to_numeric(df['scoreHome'], errors='coerce').astype('Int64')
-    df['scoreAway'] = pd.to_numeric(df['scoreAway'], errors='coerce').astype('Int64')
-
-    # ── Parse clock string (e.g. "PT12M00.00S") to seconds remaining ──
+    # Parse clock string (e.g. "PT12M00.00S") to seconds remaining
     def parse_clock(clock_str):
-        """Convert 'PT12M00.00S' to total seconds (float)."""
-        if not isinstance(clock_str, str) or not clock_str.startswith('PT'):
+        if not isinstance(clock_str, str) or not clock_str.startswith("PT"):
             return None
         try:
-            time_part = clock_str[2:]  # strip 'PT'
-            minutes, rest = time_part.split('M')
-            seconds = rest.rstrip('S')
+            time_part = clock_str[2:]
+            minutes, rest = time_part.split("M")
+            seconds = rest.rstrip("S")
             return float(minutes) * 60 + float(seconds)
         except (ValueError, AttributeError):
             return None
 
-    df['clock_seconds'] = df['clock'].apply(parse_clock)
+    df["clock_seconds"] = df["clock"].apply(parse_clock)
 
-    # ── Deduplication (by game + action number) ──
-    df = df.drop_duplicates(subset=['GAME_ID', 'actionNumber'])
-
+    df = df.drop_duplicates(subset=["GAME_ID", "actionNumber"])
     return df
 
 
-def convert_boxscores_pd(file_path: str) -> pd.DataFrame:
-    """Convert a V3 advanced boxscore JSON to a flat DataFrame of player stats."""
-    game_id = get_game_id_from_filename(file_path)
-
-    with open(file_path, 'r') as f:
-        data = json.load(f)
-
-    # V3 key is 'boxScoreAdvanced', not 'boxScoreTraditional'
-    try:
-        bs = data['boxScoreAdvanced']
-    except (KeyError, TypeError):
-        print(f"  ⚠ No boxScoreAdvanced in {file_path}, skipping.")
-        return pd.DataFrame()
-
-    all_players = []
-    for team_type in ['homeTeam', 'awayTeam']:
-        team_data = bs.get(team_type, {})
-        team_id = team_data.get('teamId')
-        team_tricode = team_data.get('teamTricode', '')
-
-        for player in team_data.get('players', []):
-            # Flatten the nested 'statistics' dict into the player row
-            row = {
-                'PERSON_ID': player.get('personId'),
-                'FIRST_NAME': player.get('firstName', ''),
-                'FAMILY_NAME': player.get('familyName', ''),
-                'NAME_I': player.get('nameI', ''),
-                'POSITION': player.get('position', ''),
-                'COMMENT': player.get('comment', ''),
-                'JERSEY_NUM': player.get('jerseyNum', ''),
-                'TEAM_ID': team_id,
-                'TEAM_TRICODE': team_tricode,
-                'TEAM_TYPE': 'HOME' if team_type == 'homeTeam' else 'AWAY',
-            }
-            # Pull all statistics into flat columns
-            stats = player.get('statistics', {})
-            for stat_key, stat_val in stats.items():
-                row[stat_key] = stat_val
-
-            all_players.append(row)
-
-    if not all_players:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(all_players)
-
-    # ── Inject Game ID ──
-    df['GAME_ID'] = game_id
-
-    # ── Type casting ──
-    df['PERSON_ID'] = pd.to_numeric(df['PERSON_ID'], errors='coerce').astype('Int64')
-    df['TEAM_ID'] = pd.to_numeric(df['TEAM_ID'], errors='coerce').astype('Int64')
-
-    # Cast all numeric stat columns
-    stat_cols = [c for c in df.columns if c not in (
-        'GAME_ID', 'PERSON_ID', 'FIRST_NAME', 'FAMILY_NAME', 'NAME_I',
-        'POSITION', 'COMMENT', 'JERSEY_NUM', 'TEAM_ID', 'TEAM_TRICODE',
-        'TEAM_TYPE', 'minutes')]
-    for col in stat_cols:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-
-    # ── Deduplication ──
-    df = df.drop_duplicates(subset=['GAME_ID', 'PERSON_ID'])
-
-    return df
-
-
-def convert_shotchart_pd(file_path: str) -> pd.DataFrame:
+def convert_shotchart(file_path: str) -> pd.DataFrame:
     """Convert a shot chart JSON (resultSets format) to DataFrame."""
     game_id = get_game_id_from_filename(file_path)
 
-    with open(file_path, 'r') as f:
+    with open(file_path, "r") as f:
         data = json.load(f)
 
     try:
-        results = data['resultSets'][0]
+        results = data["resultSets"][0]
     except (KeyError, IndexError, TypeError):
         print(f"  ⚠ No resultSets in {file_path}, skipping.")
         return pd.DataFrame()
 
-    df = pd.DataFrame(results['rowSet'], columns=results['headers'])
+    df = pd.DataFrame(results["rowSet"], columns=results["headers"])
+    df["GAME_ID"] = game_id
 
-    # Ensure GAME_ID is set
-    df['GAME_ID'] = game_id
+    # Type casting
+    df["PLAYER_ID"] = pd.to_numeric(df["PLAYER_ID"], errors="coerce").astype("Int64")
+    df["TEAM_ID"] = pd.to_numeric(df["TEAM_ID"], errors="coerce").astype("Int64")
+    df["PERIOD"] = pd.to_numeric(df["PERIOD"], errors="coerce").astype("Int64")
+    df["SHOT_DISTANCE"] = pd.to_numeric(df["SHOT_DISTANCE"], errors="coerce")
+    df["LOC_X"] = pd.to_numeric(df["LOC_X"], errors="coerce")
+    df["LOC_Y"] = pd.to_numeric(df["LOC_Y"], errors="coerce")
+    df["SHOT_ATTEMPTED_FLAG"] = df["SHOT_ATTEMPTED_FLAG"].astype(bool)
+    df["SHOT_MADE_FLAG"] = df["SHOT_MADE_FLAG"].astype(bool)
+    df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"], format="%Y%m%d", errors="coerce")
 
-    # ── Type casting ──
-    df['PLAYER_ID'] = pd.to_numeric(df['PLAYER_ID'], errors='coerce').astype('Int64')
-    df['TEAM_ID'] = pd.to_numeric(df['TEAM_ID'], errors='coerce').astype('Int64')
-    df['PERIOD'] = pd.to_numeric(df['PERIOD'], errors='coerce').astype('Int64')
-    df['SHOT_DISTANCE'] = pd.to_numeric(df['SHOT_DISTANCE'], errors='coerce')
-    df['LOC_X'] = pd.to_numeric(df['LOC_X'], errors='coerce')
-    df['LOC_Y'] = pd.to_numeric(df['LOC_Y'], errors='coerce')
-    df['SHOT_ATTEMPTED_FLAG'] = df['SHOT_ATTEMPTED_FLAG'].astype(bool)
-    df['SHOT_MADE_FLAG'] = df['SHOT_MADE_FLAG'].astype(bool)
-
-    # ── Date formatting ──
-    df['GAME_DATE'] = pd.to_datetime(df['GAME_DATE'], format='%Y%m%d', errors='coerce')
-
-    # ── Deduplication (by game + event id) ──
-    df = df.drop_duplicates(subset=['GAME_ID', 'GAME_EVENT_ID'])
-
+    df = df.drop_duplicates(subset=["GAME_ID", "GAME_EVENT_ID"])
     return df
 
 
-# ── Batch processors: read all Bronze → combine → save Silver Parquet ──
+# ── Dimension processors (unpartitioned) ─────────────────────────────
 
 def process_players():
+    """Load the static players JSON list and save as Silver parquet."""
     print("Processing players...")
-    df = convert_players_pd()
-    print(f"  {len(df)} players")
-    df.to_parquet(f"{SILVER_PATH}/players/players.parquet", index=False)
-    print(f"  ✔ Saved to {SILVER_PATH}/players/players.parquet")
-    return df
+    file_path = f"{BRONZE_PATH}/players/players.json"
+    with open(file_path, "r") as f:
+        data = json.load(f)
+
+    df = pd.DataFrame(data)
+    df["id"] = df["id"].astype(int)
+    df["is_active"] = df["is_active"].astype(bool)
+    for col in ["full_name", "first_name", "last_name"]:
+        df[col] = df[col].astype(str).str.strip()
+    df = df.drop_duplicates(subset=["id"])
+
+    out_dir = f"{SILVER_PATH}/players"
+    os.makedirs(out_dir, exist_ok=True)
+    df.to_parquet(f"{out_dir}/players.parquet", index=False)
+    print(f"  ✔ {len(df)} players → {out_dir}/players.parquet")
 
 
 def process_teams():
+    """Load all team game-log JSONs and save as a single Silver parquet."""
+    import glob
     print("Processing teams...")
     team_files = glob.glob(f"{BRONZE_PATH}/teams/*.json")
     frames = []
     for tf in sorted(team_files):
         try:
-            frames.append(convert_teams_pd(tf))
+            with open(tf, "r") as f:
+                data = json.load(f)
+            headers = data["resultSets"][0]["headers"]
+            rows = data["resultSets"][0]["rowSet"]
+            df = pd.DataFrame(rows, columns=headers)
+
+            # Type casting
+            df["TEAM_ID"] = df["TEAM_ID"].astype(int)
+            df["PTS"] = pd.to_numeric(df["PTS"], errors="coerce").astype("Int64")
+            df["PLUS_MINUS"] = pd.to_numeric(df["PLUS_MINUS"], errors="coerce")
+            for col in ["FG_PCT", "FG3_PCT", "FT_PCT"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            for col in ["FGM", "FGA", "FG3M", "FG3A", "FTM", "FTA",
+                        "OREB", "DREB", "REB", "AST", "STL", "BLK", "TOV", "PF"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
+            df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"], errors="coerce")
+            df = df.drop_duplicates(subset=["GAME_ID", "TEAM_ID"])
+            frames.append(df)
         except Exception as e:
             print(f"  ⚠ Error in {tf}: {e}")
 
     df = pd.concat(frames, ignore_index=True)
-    df = df.drop_duplicates(subset=['GAME_ID', 'TEAM_ID'])
-    print(f"  {len(df)} team-game rows from {len(team_files)} team files")
-    df.to_parquet(f"{SILVER_PATH}/teams/team_game_logs.parquet", index=False)
-    print(f"  ✔ Saved to {SILVER_PATH}/teams/team_game_logs.parquet")
-    return df
+    df = df.drop_duplicates(subset=["GAME_ID", "TEAM_ID"])
+
+    out_dir = f"{SILVER_PATH}/teams"
+    os.makedirs(out_dir, exist_ok=True)
+    df.to_parquet(f"{out_dir}/teams.parquet", index=False)
+    print(f"  ✔ {len(df)} team-game rows → {out_dir}/teams.parquet")
 
 
-def process_boxscores():
-    print("Processing boxscores...")
-    box_files = glob.glob(f"{BRONZE_PATH}/boxscores/*.json")
-    frames = []
-    for bf in sorted(box_files):
-        try:
-            df = convert_boxscores_pd(bf)
+# ── Date-based fact processors ───────────────────────────────────────
+
+def process_date(game_date: str):
+    """
+    Process all Bronze JSON files for a single date into partitioned
+    Silver Parquet files.
+    """
+    game_ids = load_manifest(game_date)
+    season = get_nba_season(game_date)
+
+    print(f"Processing {len(game_ids)} games for {game_date} (season {season})...")
+
+    # ── Boxscores ──
+    box_frames = []
+    for gid in game_ids:
+        path = f"{BRONZE_PATH}/boxscores/{gid}.json"
+        if os.path.exists(path):
+            df = convert_boxscore(path)
             if not df.empty:
-                frames.append(df)
-        except Exception as e:
-            print(f"  ⚠ Error in {bf}: {e}")
+                box_frames.append(df)
+    if box_frames:
+        save_partitioned(
+            pd.concat(box_frames, ignore_index=True),
+            "boxscores", season, game_date,
+        )
+    else:
+        print("  ⚠ No boxscore data for this date")
 
-    if not frames:
-        print("  ⚠ No boxscore data to process.")
-        return pd.DataFrame()
-
-    df = pd.concat(frames, ignore_index=True)
-    df = df.drop_duplicates(subset=['GAME_ID', 'PERSON_ID'])
-    print(f"  {len(df)} player-game rows from {len(box_files)} games")
-    df.to_parquet(f"{SILVER_PATH}/boxscores/boxscores.parquet", index=False)
-    print(f"  ✔ Saved to {SILVER_PATH}/boxscores/boxscores.parquet")
-    return df
-
-
-def process_pbp():
-    print("Processing play-by-play...")
-    pbp_files = glob.glob(f"{BRONZE_PATH}/pbp/*.json")
-    frames = []
-    for pf in sorted(pbp_files):
-        try:
-            df = convert_pbp_pd(pf)
+    # ── Play-by-Play ──
+    pbp_frames = []
+    for gid in game_ids:
+        path = f"{BRONZE_PATH}/pbp/{gid}.json"
+        if os.path.exists(path):
+            df = convert_pbp(path)
             if not df.empty:
-                frames.append(df)
-        except Exception as e:
-            print(f"  ⚠ Error in {pf}: {e}")
+                pbp_frames.append(df)
+    if pbp_frames:
+        save_partitioned(
+            pd.concat(pbp_frames, ignore_index=True),
+            "pbp", season, game_date,
+        )
+    else:
+        print("  ⚠ No PBP data for this date")
 
-    if not frames:
-        print("  ⚠ No PBP data to process.")
-        return pd.DataFrame()
-
-    df = pd.concat(frames, ignore_index=True)
-    df = df.drop_duplicates(subset=['GAME_ID', 'actionNumber'])
-    print(f"  {len(df)} play-by-play rows from {len(pbp_files)} games")
-    df.to_parquet(f"{SILVER_PATH}/pbp/pbp.parquet", index=False)
-    print(f"  ✔ Saved to {SILVER_PATH}/pbp/pbp.parquet")
-    return df
-
-
-def process_shotcharts():
-    print("Processing shot charts...")
-    sc_files = glob.glob(f"{BRONZE_PATH}/shot_chart/*.json")
-    frames = []
-    for sf in sorted(sc_files):
-        try:
-            df = convert_shotchart_pd(sf)
+    # ── Shot Charts ──
+    shot_frames = []
+    for gid in game_ids:
+        path = f"{BRONZE_PATH}/shot_chart/{gid}.json"
+        if os.path.exists(path):
+            df = convert_shotchart(path)
             if not df.empty:
-                frames.append(df)
-        except Exception as e:
-            print(f"  ⚠ Error in {sf}: {e}")
-
-    if not frames:
-        print("  ⚠ No shot chart data to process.")
-        return pd.DataFrame()
-
-    df = pd.concat(frames, ignore_index=True)
-    df = df.drop_duplicates(subset=['GAME_ID', 'GAME_EVENT_ID'])
-    print(f"  {len(df)} shot rows from {len(sc_files)} games")
-    df.to_parquet(f"{SILVER_PATH}/shot_chart/shot_charts.parquet", index=False)
-    print(f"  ✔ Saved to {SILVER_PATH}/shot_chart/shot_charts.parquet")
-    return df
+                shot_frames.append(df)
+    if shot_frames:
+        save_partitioned(
+            pd.concat(shot_frames, ignore_index=True),
+            "shot_chart", season, game_date,
+        )
+    else:
+        print("  ⚠ No shot chart data for this date")
 
 
-# ── Main ─────────────────────────────────────────────────────────────
+# ── CLI ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Transform Bronze JSON → partitioned Silver Parquet for a date."
+    )
+    parser.add_argument(
+        "game_date",
+        help="Date to process in YYYY-MM-DD format (e.g. 2024-01-15)",
+    )
+    parser.add_argument(
+        "--dims",
+        action="store_true",
+        help="Also process dimension tables (players + teams). "
+             "Only needed on first run or periodically.",
+    )
+    args = parser.parse_args()
+
     print("=" * 50)
-    print("Bronze → Silver Data Extraction")
+    print(f"Bronze → Silver: {args.game_date}")
     print("=" * 50)
 
-    process_players()
-    process_teams()
-    process_boxscores()
-    process_shotcharts()
-    process_pbp()
+    if args.dims:
+        process_players()
+        process_teams()
+
+    process_date(args.game_date)
 
     print()
     print("=" * 50)
-    print("Done! Silver layer parquets written.")
+    print("Done! Silver parquets written.")
     print("=" * 50)

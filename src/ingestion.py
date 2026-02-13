@@ -25,7 +25,7 @@ from nba_api.stats.endpoints import (
 BRONZE_PATH = os.getenv("BRONZE_PATH", "/app/datalake/bronze")
 RATE_LIMIT = 0.600  # seconds between API calls
 
-for folder in ["teams", "players", "pbp", "boxscores", "shot_chart"]:
+for folder in ["teams", "players", "pbp", "boxscores", "shot_chart", "manifests"]:
     os.makedirs(f"{BRONZE_PATH}/{folder}", exist_ok=True)
 
 
@@ -171,6 +171,10 @@ def ingest_date(game_date: str):
         download_boxscore(gid)
         download_pbp(gid)
         download_shotchart(gid)
+
+    # Save a manifest so downstream scripts know which games belong to this date
+    manifest = {"game_date": game_date, "game_ids": game_ids}
+    _save_json(manifest, f"{BRONZE_PATH}/manifests/{game_date}.json")
 
     print(f"✔ Done ingesting {game_date} ({len(game_ids)} games)")
 
