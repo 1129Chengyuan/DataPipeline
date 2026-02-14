@@ -369,6 +369,11 @@ def process_teams():
 
 def process_date(game_date: str):
     game_ids = load_manifest(game_date)
+
+    if not game_ids:
+        logger.info("No games on %s — nothing to extract.", game_date)
+        return
+
     season = get_nba_season(game_date)
     logger.info("Processing %d games for %s (season %d)", len(game_ids), game_date, season)
 

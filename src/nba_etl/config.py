@@ -3,7 +3,10 @@ Centralized configuration for the NBA ETL pipeline.
 
 All environment variables and defaults live here.
 Import from any script:
-    from config import settings
+    from nba_etl.config import settings
+
+Defaults point to Airflow paths (/opt/airflow/datalake/...).
+The standalone `etl` container overrides via env vars to /app/datalake/...
 """
 
 from pydantic_settings import BaseSettings
@@ -13,8 +16,8 @@ class Settings(BaseSettings):
     """Pipeline configuration, overridable via environment variables."""
 
     # ── Paths ──
-    bronze_path: str = "/app/datalake/bronze"
-    silver_path: str = "/app/datalake/silver"
+    bronze_path: str = "/opt/airflow/datalake/bronze"
+    silver_path: str = "/opt/airflow/datalake/silver"
 
     # ── API ──
     rate_limit: float = 0.600  # seconds between NBA API calls
@@ -39,3 +42,4 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+

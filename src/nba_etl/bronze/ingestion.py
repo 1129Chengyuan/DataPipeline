@@ -147,7 +147,9 @@ def ingest_date(game_date: str):
     game_ids = get_game_ids_for_date(game_date)
 
     if not game_ids:
-        logger.info("No games on %s, nothing to do.", game_date)
+        logger.info("No games on %s — writing empty manifest.", game_date)
+        manifest = {"game_date": game_date, "game_ids": []}
+        _save_json(manifest, f"{BRONZE}/manifests/{game_date}.json")
         return
 
     logger.info("Downloading data for %d games...", len(game_ids))

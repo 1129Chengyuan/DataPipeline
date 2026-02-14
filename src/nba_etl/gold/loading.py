@@ -13,6 +13,7 @@ key constraints are caught and logged, not silently filtered in Python.
 """
 
 import os
+import json
 import logging
 import argparse
 from datetime import datetime
@@ -57,7 +58,7 @@ def read_silver_partition(dataset: str, game_date: str) -> pd.DataFrame:
     season = get_nba_season(game_date)
     path = f"{SILVER}/{dataset}/season={season}/game_date={game_date}/data.parquet"
     if not os.path.exists(path):
-        logger.warning("No Silver data at %s", path)
+        logger.debug("No Silver data at %s", path)
         return pd.DataFrame()
     return pd.read_parquet(path)
 
@@ -320,9 +321,78 @@ def load_fact_team_stats():
     logger.info("fact_team_stats: %d rows upserted", count)
 
 
+# ── Auto-dimension helpers ───────────────────────────────────────────
+
+def _ensure_dims_for_date(game_date: str):
+    """
+    Upsert stub dimension records (games, players, teams) from the Silver
+    boxscore data for this date.  This ensures FK refs exist before fact
+    inserts, making each date fully self-contained during backfill.
+    """
+    df = read_silver_partition("boxscores", game_date)
+    if df.empty:
+        return
+
+    season = get_nba_season(game_date)
+
+    with engine.begin() as conn:
+        # ── games ──
+        game_ids = df["GAME_ID"].dropna().unique()
+        for gid in game_ids:
+            conn.execute(text(
+                "INSERT INTO games (game_id, season_id, game_date) "
+                "VALUES (:gid, :season, :gdate) "
+                "ON CONFLICT (game_id) DO NOTHING"
+            ), {"gid": gid, "season": season, "gdate": game_date})
+
+        # ── players ──
+        players = (
+            df[["PERSON_ID", "FIRST_NAME", "FAMILY_NAME"]]
+            .dropna(subset=["PERSON_ID"])
+            .drop_duplicates(subset=["PERSON_ID"])
+        )
+        for _, row in players.iterrows():
+            conn.execute(text(
+                "INSERT INTO players (player_id, first_name, last_name, is_active) "
+                "VALUES (:pid, :first, :last, TRUE) "
+                "ON CONFLICT (player_id) DO NOTHING"
+            ), {
+                "pid": int(row["PERSON_ID"]),
+                "first": row.get("FIRST_NAME", ""),
+                "last": row.get("FAMILY_NAME", ""),
+            })
+
+        # ── teams ──
+        teams = (
+            df[["TEAM_ID", "TEAM_TRICODE"]]
+            .dropna(subset=["TEAM_ID"])
+            .drop_duplicates(subset=["TEAM_ID"])
+        )
+        for _, row in teams.iterrows():
+            conn.execute(text(
+                "INSERT INTO teams (id, abbreviation, team_name) "
+                "VALUES (:tid, :abbr, :abbr) "
+                "ON CONFLICT (id) DO NOTHING"
+            ), {"tid": int(row["TEAM_ID"]), "abbr": row.get("TEAM_TRICODE", "")})
+
+    logger.debug("Dimension stubs ensured for %s", game_date)
+
+
 # ── Orchestration ────────────────────────────────────────────────────
 
 def load_date(game_date: str):
+    # Check manifest — skip no-game days
+    manifest_path = f"{settings.bronze_path}/manifests/{game_date}.json"
+    if os.path.exists(manifest_path):
+        with open(manifest_path) as f:
+            game_ids = json.load(f).get("game_ids", [])
+        if not game_ids:
+            logger.info("No games on %s — nothing to load.", game_date)
+            return
+
+    # Create stub dimension records so FK joins resolve
+    _ensure_dims_for_date(game_date)
+
     load_fact_player_stats(game_date)
     load_fact_pbp(game_date)
     load_fact_shots(game_date)
