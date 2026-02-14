@@ -39,7 +39,7 @@ def main():
     for i, date in enumerate(TEST_DATES):
         dims_flag = "--dims" if i == 0 else ""
         ok = run(
-            f"python src/ingestion.py {date} {dims_flag}",
+            f"python -m nba_etl.bronze.ingestion {date} {dims_flag}",
             f"INGEST: {date} {'(+dims)' if dims_flag else ''}")
         if not ok:
             sys.exit(1)
@@ -48,7 +48,7 @@ def main():
     for i, date in enumerate(TEST_DATES):
         dims_flag = "--dims" if i == 0 else ""
         ok = run(
-            f"python src/data_extraction.py {date} {dims_flag}",
+            f"python -m nba_etl.silver.extraction {date} {dims_flag}",
             f"EXTRACT: {date} {'(+dims)' if dims_flag else ''}")
         if not ok:
             sys.exit(1)
@@ -57,7 +57,7 @@ def main():
     for i, date in enumerate(TEST_DATES):
         dims_flag = "--dims" if i == 0 else ""
         ok = run(
-            f"python src/gold.py {date} {dims_flag}",
+            f"python -m nba_etl.gold.loading {date} {dims_flag}",
             f"GOLD: {date} {'(+dims)' if dims_flag else ''}")
         if not ok:
             sys.exit(1)
@@ -89,7 +89,6 @@ def main():
         print(f"\n{'Game Date':<15} {'Players':>10} {'PBP':>10} {'Shots':>10}")
         print("-" * 47)
         for date in TEST_DATES:
-            # Get game_ids for this date from games dimension
             gids = [r[0] for r in conn.execute(
                 text("SELECT game_id FROM games WHERE game_date = :d"),
                 {"d": date}

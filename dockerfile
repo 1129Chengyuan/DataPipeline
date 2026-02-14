@@ -3,6 +3,7 @@ FROM python:3.11-slim
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app/src
 
 # Set the working directory in the container
 WORKDIR /app
@@ -15,6 +16,3 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the rest of the application code into the container
 COPY . .
-
-# Run etl_pipeline.py when the container launches
-CMD ["python", "etl_pipeline.py"]

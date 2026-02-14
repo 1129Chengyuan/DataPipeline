@@ -22,7 +22,7 @@ from nba_api.stats.endpoints import (
     boxscoreadvancedv3,
     playbyplayv3,
 )
-from config import settings
+from nba_etl.config import settings
 
 logger = logging.getLogger(__name__)
 

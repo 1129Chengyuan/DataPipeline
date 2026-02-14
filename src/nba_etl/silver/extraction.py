@@ -11,6 +11,14 @@ Output structure:
     silver/shot_chart/season=2023/game_date=2024-01-15/data.parquet
     silver/players/players.parquet       (unpartitioned dimension)
     silver/teams/teams.parquet           (unpartitioned dimension)
+
+Data Contracts:
+    Each converter validates its DataFrame before returning:
+    - PK uniqueness
+    - Critical column nulls
+    - Value ranges (periods, percentages, coordinates, etc.)
+    - Row count minimums
+    Violations are logged as warnings/errors. A summary is printed per run.
 """
 
 import os
@@ -19,10 +27,11 @@ import glob
 import logging
 import argparse
 from datetime import datetime
+from dataclasses import dataclass, field
 
 import pandas as pd
 
-from config import settings
+from nba_etl.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +39,77 @@ BRONZE = settings.bronze_path
 SILVER = settings.silver_path
 
 
+# ── Validation framework ─────────────────────────────────────────────
+
+@dataclass
+class ValidationResult:
+    """Tracks validation issues for a single DataFrame."""
+    source: str
+    issues: list[str] = field(default_factory=list)
+
+    @property
+    def passed(self) -> bool:
+        return len(self.issues) == 0
+
+    def check_pk_unique(self, df: pd.DataFrame, pk_cols: list[str]):
+        dupes = df[pk_cols].duplicated().sum()
+        if dupes > 0:
+            self.issues.append(f"DUPLICATE PK: {dupes} rows on {pk_cols}")
+            logger.error("  ✘ %s: %d duplicate PKs on %s", self.source, dupes, pk_cols)
+
+    def check_not_null(self, df: pd.DataFrame, columns: list[str]):
+        for col in columns:
+            if col not in df.columns:
+                self.issues.append(f"MISSING COLUMN: {col}")
+                logger.error("  ✘ %s: expected column '%s' not found", self.source, col)
+                continue
+            nulls = df[col].isnull().sum()
+            if nulls > 0:
+                self.issues.append(f"NULL: {col} has {nulls}/{len(df)} nulls")
+                logger.warning("  ⚠ %s: %s has %d/%d nulls (%.1f%%)",
+                               self.source, col, nulls, len(df), nulls * 100 / len(df))
+
+    def check_range(self, df: pd.DataFrame, col: str, min_val=None, max_val=None):
+        if col not in df.columns:
+            return
+        series = pd.to_numeric(df[col], errors="coerce").dropna()
+        if series.empty:
+            return
+        if min_val is not None and (series < min_val).any():
+            bad = (series < min_val).sum()
+            self.issues.append(f"RANGE: {col} has {bad} values below {min_val}")
+            logger.warning("  ⚠ %s: %s has %d values below %s", self.source, col, bad, min_val)
+        if max_val is not None and (series > max_val).any():
+            bad = (series > max_val).sum()
+            self.issues.append(f"RANGE: {col} has {bad} values above {max_val}")
+            logger.warning("  ⚠ %s: %s has %d values above %s", self.source, col, bad, max_val)
+
+    def check_min_rows(self, df: pd.DataFrame, min_rows: int):
+        if len(df) < min_rows:
+            self.issues.append(f"ROW COUNT: {len(df)} rows (expected ≥{min_rows})")
+            logger.warning("  ⚠ %s: only %d rows (expected ≥%d)", self.source, len(df), min_rows)
+
+    def log_summary(self):
+        if self.passed:
+            logger.info("  ✔ %s: all checks passed", self.source)
+        else:
+            logger.warning("  ⚠ %s: %d issue(s) found", self.source, len(self.issues))
+
+
+# Global list to collect all validation results for end-of-run report
+_all_validations: list[ValidationResult] = []
+
+
+def _validate(source: str) -> ValidationResult:
+    """Create and register a new validation result."""
+    v = ValidationResult(source=source)
+    _all_validations.append(v)
+    return v
+
+
 # ── Season helper ────────────────────────────────────────────────────
 
 def get_nba_season(game_date: str) -> int:
-    """Oct+ = current year, Jan-Sep = year - 1."""
     dt = datetime.strptime(game_date, "%Y-%m-%d")
     return dt.year if dt.month >= 10 else dt.year - 1
 
@@ -112,7 +188,21 @@ def convert_boxscore(file_path: str) -> pd.DataFrame:
             "POSITION", "COMMENT", "JERSEY_NUM", "TEAM_ID", "TEAM_TRICODE",
             "TEAM_TYPE", "minutes")]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df.drop_duplicates(subset=["GAME_ID", "PERSON_ID"])
+    df = df.drop_duplicates(subset=["GAME_ID", "PERSON_ID"])
+
+    # ── Validation ──
+    v = _validate(f"boxscore/{game_id}")
+    v.check_pk_unique(df, ["GAME_ID", "PERSON_ID"])
+    v.check_not_null(df, ["GAME_ID", "PERSON_ID", "TEAM_ID"])
+    v.check_min_rows(df, 10)  # expect at least 10 players per game
+    v.check_range(df, "offensiveRating", min_val=0, max_val=300)
+    v.check_range(df, "defensiveRating", min_val=0, max_val=300)
+    v.check_range(df, "usagePercentage", min_val=0, max_val=1)
+    v.check_range(df, "trueShootingPercentage", min_val=0, max_val=2)
+    v.check_range(df, "PIE", min_val=-1, max_val=1)
+    v.log_summary()
+
+    return df
 
 
 def convert_pbp(file_path: str) -> pd.DataFrame:
@@ -149,7 +239,21 @@ def convert_pbp(file_path: str) -> pd.DataFrame:
             return None
 
     df["clock_seconds"] = df["clock"].apply(_parse_clock)
-    return df.drop_duplicates(subset=["GAME_ID", "actionNumber"])
+    df = df.drop_duplicates(subset=["GAME_ID", "actionNumber"])
+
+    # ── Validation ──
+    v = _validate(f"pbp/{game_id}")
+    v.check_pk_unique(df, ["GAME_ID", "actionNumber"])
+    v.check_not_null(df, ["GAME_ID", "actionNumber", "period", "actionType"])
+    v.check_min_rows(df, 100)  # expect at least 100 actions per game
+    v.check_range(df, "period", min_val=1, max_val=10)  # up to 4OT
+    v.check_range(df, "clock_seconds", min_val=0, max_val=720)
+    v.check_range(df, "shotDistance", min_val=0, max_val=94)  # court is 94 ft
+    v.check_range(df, "scoreHome", min_val=0)
+    v.check_range(df, "scoreAway", min_val=0)
+    v.log_summary()
+
+    return df
 
 
 def convert_shotchart(file_path: str) -> pd.DataFrame:
@@ -164,6 +268,9 @@ def convert_shotchart(file_path: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = pd.DataFrame(results["rowSet"], columns=results["headers"])
+    if df.empty:
+        return df
+
     df["GAME_ID"] = game_id
     df["PLAYER_ID"] = pd.to_numeric(df["PLAYER_ID"], errors="coerce").astype("Int64")
     df["TEAM_ID"] = pd.to_numeric(df["TEAM_ID"], errors="coerce").astype("Int64")
@@ -174,7 +281,19 @@ def convert_shotchart(file_path: str) -> pd.DataFrame:
     df["SHOT_ATTEMPTED_FLAG"] = df["SHOT_ATTEMPTED_FLAG"].astype(bool)
     df["SHOT_MADE_FLAG"] = df["SHOT_MADE_FLAG"].astype(bool)
     df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"], format="%Y%m%d", errors="coerce")
-    return df.drop_duplicates(subset=["GAME_ID", "GAME_EVENT_ID"])
+    df = df.drop_duplicates(subset=["GAME_ID", "GAME_EVENT_ID"])
+
+    # ── Validation ──
+    v = _validate(f"shots/{game_id}")
+    v.check_pk_unique(df, ["GAME_ID", "GAME_EVENT_ID"])
+    v.check_not_null(df, ["GAME_ID", "GAME_EVENT_ID", "PLAYER_ID", "TEAM_ID", "PERIOD"])
+    v.check_range(df, "PERIOD", min_val=1, max_val=10)
+    v.check_range(df, "LOC_X", min_val=-250, max_val=250)   # half-court coords
+    v.check_range(df, "LOC_Y", min_val=-50, max_val=900)
+    v.check_range(df, "SHOT_DISTANCE", min_val=0, max_val=94)
+    v.log_summary()
+
+    return df
 
 
 # ── Dimension processors (unpartitioned) ─────────────────────────────
@@ -189,6 +308,14 @@ def process_players():
     for col in ["full_name", "first_name", "last_name"]:
         df[col] = df[col].astype(str).str.strip()
     df = df.drop_duplicates(subset=["id"])
+
+    # ── Validation ──
+    v = _validate("players")
+    v.check_pk_unique(df, ["id"])
+    v.check_not_null(df, ["id", "full_name", "first_name", "last_name"])
+    v.check_min_rows(df, 4000)  # NBA has had >4k players historically
+    v.log_summary()
+
     out = f"{SILVER}/players"
     os.makedirs(out, exist_ok=True)
     df.to_parquet(f"{out}/players.parquet", index=False)
@@ -220,6 +347,18 @@ def process_teams():
             logger.error("Error in %s: %s", tf, e)
 
     df = pd.concat(frames, ignore_index=True).drop_duplicates(subset=["GAME_ID", "TEAM_ID"])
+
+    # ── Validation ──
+    v = _validate("teams")
+    v.check_pk_unique(df, ["GAME_ID", "TEAM_ID"])
+    v.check_not_null(df, ["GAME_ID", "TEAM_ID", "GAME_DATE", "PTS"])
+    v.check_min_rows(df, 50_000)  # 30 teams × ~80 games/yr × 20+ years
+    v.check_range(df, "PTS", min_val=0, max_val=200)
+    v.check_range(df, "FG_PCT", min_val=0, max_val=1)
+    v.check_range(df, "FG3_PCT", min_val=0, max_val=1)
+    v.check_range(df, "FT_PCT", min_val=0, max_val=1)
+    v.log_summary()
+
     out = f"{SILVER}/teams"
     os.makedirs(out, exist_ok=True)
     df.to_parquet(f"{out}/teams.parquet", index=False)
@@ -251,6 +390,30 @@ def process_date(game_date: str):
             logger.warning("No %s data for %s", dataset, game_date)
 
 
+def print_validation_report():
+    """Print a summary of all validation results for this run."""
+    if not _all_validations:
+        return
+
+    passed = sum(1 for v in _all_validations if v.passed)
+    failed = sum(1 for v in _all_validations if not v.passed)
+
+    logger.info("─" * 50)
+    logger.info("DATA VALIDATION REPORT")
+    logger.info("─" * 50)
+    logger.info("  Checked: %d datasets", len(_all_validations))
+    logger.info("  Passed:  %d", passed)
+    if failed:
+        logger.warning("  Failed:  %d", failed)
+        for v in _all_validations:
+            if not v.passed:
+                for issue in v.issues:
+                    logger.warning("    %s: %s", v.source, issue)
+    else:
+        logger.info("  Failed:  0")
+    logger.info("─" * 50)
+
+
 # ── CLI ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -277,4 +440,6 @@ if __name__ == "__main__":
         process_teams()
 
     process_date(args.game_date)
+
+    print_validation_report()
     logger.info("Done — Silver parquets written.")
