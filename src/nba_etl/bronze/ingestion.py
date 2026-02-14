@@ -43,12 +43,72 @@ def _already_exists(path: str) -> bool:
     return os.path.exists(path)
 
 
+# ── Rate-limit aware API caller ──────────────────────────────────────
+
+_MAX_RETRIES = 5
+_BASE_BACKOFF = 10  # seconds — doubles each retry: 10, 20, 40, 80, 160
+_CALL_DELAY = 1.5   # seconds between successful calls
+_JITTER = 1.0       # random 0-1s added to each delay
+
+import random
+
+def _api_call(fn, label: str, *args, **kwargs):
+    """
+    Call an NBA API function with retry + exponential backoff.
+    Detects rate-limiting (timeouts, connection resets) and waits.
+    Returns the result or raises after MAX_RETRIES.
+    """
+    for attempt in range(1, _MAX_RETRIES + 1):
+        try:
+            result = fn(*args, **kwargs)
+            # Success — sleep to stay under rate limits
+            time.sleep(_CALL_DELAY + random.uniform(0, _JITTER))
+            return result
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            err_str = str(e).lower()
+            is_rate_limit = any(k in err_str for k in [
+                "timed out", "read timeout", "connection aborted",
+                "remotedisconnected", "429", "too many requests",
+            ])
+
+            if attempt == _MAX_RETRIES:
+                logger.error("%s: FAILED after %d attempts: %s",
+                             label, _MAX_RETRIES, e)
+                raise
+
+            wait = _BASE_BACKOFF * (2 ** (attempt - 1)) + random.uniform(0, 5)
+
+            if is_rate_limit:
+                # Rate limited — wait longer
+                wait = max(wait, 30 * attempt)
+                logger.warning(
+                    "%s: rate-limited (attempt %d/%d) — waiting %.0fs: %s",
+                    label, attempt, _MAX_RETRIES, wait, e,
+                )
+            else:
+                logger.warning(
+                    "%s: error (attempt %d/%d) — retrying in %.0fs: %s",
+                    label, attempt, _MAX_RETRIES, wait, e,
+                )
+
+            time.sleep(wait)
+
+    # Should never reach here
+    raise RuntimeError(f"{label}: exhausted all retries")
+
+
 # ── Date-based game discovery ────────────────────────────────────────
 
 def get_game_ids_for_date(game_date: str) -> list[str]:
     """Use ScoreboardV2 to find all game IDs played on a date."""
     logger.info("Looking up games on %s", game_date)
-    sb = scoreboardv2.ScoreboardV2(game_date=game_date)
+    sb = _api_call(
+        scoreboardv2.ScoreboardV2,
+        f"scoreboard/{game_date}",
+        game_date=game_date,
+    )
     data = sb.get_dict()
 
     game_header = [
@@ -69,44 +129,42 @@ def download_boxscore(game_id: str):
     path = f"{BRONZE}/boxscores/{game_id}.json"
     if _already_exists(path):
         return
-    try:
-        data = boxscoreadvancedv3.BoxScoreAdvancedV3(game_id=game_id).get_dict()
-        _save_json(data, path)
-        logger.info("boxscore %s ✔", game_id)
-        time.sleep(settings.rate_limit)
-    except Exception as e:
-        logger.error("boxscore %s ✘: %s", game_id, e)
+    result = _api_call(
+        boxscoreadvancedv3.BoxScoreAdvancedV3,
+        f"boxscore/{game_id}",
+        game_id=game_id,
+    )
+    _save_json(result.get_dict(), path)
+    logger.info("boxscore %s ✔", game_id)
 
 
 def download_pbp(game_id: str):
     path = f"{BRONZE}/pbp/{game_id}.json"
     if _already_exists(path):
         return
-    try:
-        data = playbyplayv3.PlayByPlayV3(game_id=game_id).get_dict()
-        _save_json(data, path)
-        logger.info("pbp     %s ✔", game_id)
-        time.sleep(settings.rate_limit)
-    except Exception as e:
-        logger.error("pbp     %s ✘: %s", game_id, e)
+    result = _api_call(
+        playbyplayv3.PlayByPlayV3,
+        f"pbp/{game_id}",
+        game_id=game_id,
+    )
+    _save_json(result.get_dict(), path)
+    logger.info("pbp     %s ✔", game_id)
 
 
 def download_shotchart(game_id: str):
     path = f"{BRONZE}/shot_chart/{game_id}.json"
     if _already_exists(path):
         return
-    try:
-        data = shotchartdetail.ShotChartDetail(
-            team_id=0,
-            player_id=0,
-            game_id_nullable=game_id,
-            context_measure_simple="FGA",
-        ).get_dict()
-        _save_json(data, path)
-        logger.info("shots   %s ✔", game_id)
-        time.sleep(settings.rate_limit)
-    except Exception as e:
-        logger.error("shots   %s ✘: %s", game_id, e)
+    result = _api_call(
+        shotchartdetail.ShotChartDetail,
+        f"shots/{game_id}",
+        team_id=0,
+        player_id=0,
+        game_id_nullable=game_id,
+        context_measure_simple="FGA",
+    )
+    _save_json(result.get_dict(), path)
+    logger.info("shots   %s ✔", game_id)
 
 
 # ── Dimension downloaders (run once / infrequently) ──────────────────
