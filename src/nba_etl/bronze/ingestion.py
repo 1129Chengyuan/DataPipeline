@@ -12,8 +12,11 @@ parallel backfills across an entire season.
 import os
 import json
 import time
+import random
 import logging
 import argparse
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from nba_api.stats.static import teams, players
 from nba_api.stats.endpoints import (
@@ -49,18 +52,21 @@ _MAX_RETRIES = 5
 _BASE_BACKOFF = 10  # seconds — doubles each retry: 10, 20, 40, 80, 160
 _CALL_DELAY = 1.5   # seconds between successful calls
 _JITTER = 1.0       # random 0-1s added to each delay
+_MAX_CONCURRENT = 3  # max simultaneous API requests (threads)
 
-import random
+_api_semaphore = threading.Semaphore(_MAX_CONCURRENT)
 
 def _api_call(fn, label: str, *args, **kwargs):
     """
     Call an NBA API function with retry + exponential backoff.
+    Uses a global semaphore to limit concurrent requests.
     Detects rate-limiting (timeouts, connection resets) and waits.
     Returns the result or raises after MAX_RETRIES.
     """
     for attempt in range(1, _MAX_RETRIES + 1):
         try:
-            result = fn(*args, **kwargs)
+            with _api_semaphore:
+                result = fn(*args, **kwargs)
             # Success — sleep to stay under rate limits
             time.sleep(_CALL_DELAY + random.uniform(0, _JITTER))
             return result
@@ -200,8 +206,15 @@ def download_all_players():
 
 # ── Orchestration ────────────────────────────────────────────────────
 
+def _download_game(game_id: str):
+    """Download all 3 files for a single game (called from threads)."""
+    download_boxscore(game_id)
+    download_pbp(game_id)
+    download_shotchart(game_id)
+
+
 def ingest_date(game_date: str):
-    """Full ingestion for one date."""
+    """Full ingestion for one date, with threaded per-game downloads."""
     game_ids = get_game_ids_for_date(game_date)
 
     if not game_ids:
@@ -210,11 +223,25 @@ def ingest_date(game_date: str):
         _save_json(manifest, f"{BRONZE}/manifests/{game_date}.json")
         return
 
-    logger.info("Downloading data for %d games...", len(game_ids))
-    for gid in game_ids:
-        download_boxscore(gid)
-        download_pbp(gid)
-        download_shotchart(gid)
+    logger.info("Downloading data for %d games (threaded)...", len(game_ids))
+
+    # Download games concurrently — the _api_semaphore inside _api_call
+    # limits actual simultaneous HTTP requests to _MAX_CONCURRENT
+    errors = []
+    with ThreadPoolExecutor(max_workers=_MAX_CONCURRENT) as pool:
+        futures = {pool.submit(_download_game, gid): gid for gid in game_ids}
+        for future in as_completed(futures):
+            gid = futures[future]
+            try:
+                future.result()
+            except Exception as e:
+                logger.error("Game %s failed: %s", gid, e)
+                errors.append(gid)
+
+    if errors:
+        raise RuntimeError(
+            f"{len(errors)} game(s) failed on {game_date}: {errors}"
+        )
 
     # Save manifest for downstream scripts
     manifest = {"game_date": game_date, "game_ids": game_ids}
