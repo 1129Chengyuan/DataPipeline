@@ -36,10 +36,11 @@ from nba_etl.config import settings
 from nba_etl.bronze.ingestion import (
     ingest_date, download_all_teams, download_all_players,
 )
-from nba_etl.silver.extraction import (
-    process_date, process_players, process_teams,
-    print_validation_report, _all_validations,
+from nba_etl.silver.spark_extraction import (
+    process_date_spark, print_validation_report,
+    _validation_results,
 )
+from nba_etl.silver.extraction import process_players, process_teams
 from nba_etl.gold.loading import load_date, init_schema, load_dim_players, load_dim_teams
 
 logger = logging.getLogger("backfill")
@@ -80,7 +81,7 @@ def is_already_done(game_date: str) -> bool:
 def process_single_date(game_date: str):
     """Bronze → Silver → Gold for one date. Raises on failure."""
     ingest_date(game_date)
-    process_date(game_date)
+    process_date_spark(game_date)
     load_date(game_date)
 
 
@@ -211,7 +212,7 @@ def run_backfill(start: str, end: str, skip_existing: bool = True,
 
     # Validation report
     print_validation_report()
-    _all_validations.clear()
+    _validation_results.clear()
 
 
 if __name__ == "__main__":

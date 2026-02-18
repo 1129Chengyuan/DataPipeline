@@ -47,7 +47,7 @@ with DAG(
 
     extract = BashOperator(
         task_id="silver_extract",
-        bash_command="python -m nba_etl.silver.extraction {{ ds }}",
+        bash_command="python -m nba_etl.silver.spark_extraction {{ ds }}",
         env=_PYTHONPATH_ENV,
     )
 
