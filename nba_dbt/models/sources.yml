@@ -1,0 +1,48 @@
+version: 2
+
+sources:
+  - name: nba_gold
+    description: "NBA Gold layer tables — loaded by the ETL pipeline (loading.py)"
+    schema: public
+    tables:
+      - name: games
+        description: "Dimension: one row per NBA game"
+        columns:
+          - name: game_id
+            tests: [unique, not_null]
+
+      - name: players
+        description: "Dimension: one row per NBA player"
+        columns:
+          - name: player_id
+            tests: [unique, not_null]
+
+      - name: teams
+        description: "Dimension: one row per NBA team"
+        columns:
+          - name: id
+            tests: [unique, not_null]
+
+      - name: fact_player_stats
+        description: "Fact: player advanced stats per game (boxscore)"
+        columns:
+          - name: game_id
+            tests: [not_null]
+          - name: player_id
+            tests: [not_null]
+
+      - name: fact_play_by_play
+        description: "Fact: play-by-play actions per game"
+        columns:
+          - name: game_id
+            tests: [not_null]
+          - name: action_number
+            tests: [not_null]
+
+      - name: fact_shots
+        description: "Fact: shot chart with spatial coordinates"
+        columns:
+          - name: game_id
+            tests: [not_null]
+          - name: game_event_id
+            tests: [not_null]

@@ -1,0 +1,12 @@
+nba_analytics:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: "{{ env_var('DBT_HOST', 'pgdatabase') }}"
+      port: 5432
+      user: root
+      password: root
+      dbname: mydatabase
+      schema: public
+      threads: 4

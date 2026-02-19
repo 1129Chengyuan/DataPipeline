@@ -1,0 +1,94 @@
+version: 2
+
+models:
+  # ── Staging ────────────────────────────────────────────────────────
+  - name: stg_games
+    description: "Game dimension with season label and date parts"
+    columns:
+      - name: game_id
+        description: "NBA game identifier (e.g. 0022300555)"
+        tests: [unique, not_null]
+      - name: season
+        description: "Season start year (e.g. 2023 for the 2023-24 season)"
+        tests: [not_null]
+
+  - name: stg_players
+    description: "Player dimension with full name"
+    columns:
+      - name: player_id
+        description: "NBA player identifier"
+        tests: [unique, not_null]
+
+  - name: stg_teams
+    description: "Team dimension — renames id → team_id"
+    columns:
+      - name: team_id
+        description: "NBA team identifier"
+        tests: [unique, not_null]
+
+  - name: stg_player_stats
+    description: "Player advanced stats per game with did_play flag"
+    columns:
+      - name: game_id
+        tests: [not_null]
+      - name: player_id
+        tests: [not_null]
+      - name: usg_pct
+        description: "Usage percentage (0.0 – 1.0)"
+      - name: ts_pct
+        description: "True shooting percentage (0.0 – 1.0)"
+
+  - name: stg_shots
+    description: "Shot chart with simplified zone grouping"
+    columns:
+      - name: game_id
+        tests: [not_null]
+      - name: game_event_id
+        tests: [not_null]
+      - name: shot_zone_group
+        description: "Simplified zone: Paint, Mid-Range, Three, Corner Three, Backcourt"
+        tests:
+          - accepted_values:
+              values: ['Paint', 'Mid-Range', 'Three', 'Corner Three', 'Backcourt', 'Other']
+
+  # ── Marts ──────────────────────────────────────────────────────────
+  - name: fct_player_season_averages
+    description: "Per-player per-season averages — the classic stat line"
+    columns:
+      - name: player_id
+        tests: [not_null]
+      - name: season
+        tests: [not_null]
+      - name: games_played
+        description: "Number of games with minutes > 0"
+        tests:
+          - not_null
+
+  - name: fct_team_game_results
+    description: "Per-team per-game results with running season record"
+    columns:
+      - name: game_id
+        tests: [not_null]
+      - name: team_id
+        tests: [not_null]
+      - name: result
+        description: "W or L based on net rating"
+        tests:
+          - accepted_values:
+              values: ['W', 'L']
+
+  - name: fct_player_shooting_splits
+    description: "Player shooting efficiency by zone and season"
+    columns:
+      - name: player_id
+        tests: [not_null]
+      - name: fg_pct
+        description: "Field goal percentage for this zone (0.0 – 1.0)"
+
+  - name: dim_players_enriched
+    description: "Player dimension enriched with career stats from fact tables"
+    columns:
+      - name: player_id
+        tests: [unique, not_null]
+      - name: full_name
+        tests: [not_null]

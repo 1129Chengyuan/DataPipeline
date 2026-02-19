@@ -57,7 +57,25 @@ with DAG(
         env=_PYTHONPATH_ENV,
     )
 
-    ingest >> extract >> load
+    dbt_run = BashOperator(
+        task_id="dbt_run",
+        bash_command=(
+            "dbt run "
+            "--project-dir /app/nba_dbt "
+            "--profiles-dir /app/nba_dbt"
+        ),
+    )
+
+    dbt_test = BashOperator(
+        task_id="dbt_test",
+        bash_command=(
+            "dbt test "
+            "--project-dir /app/nba_dbt "
+            "--profiles-dir /app/nba_dbt"
+        ),
+    )
+
+    ingest >> extract >> load >> dbt_run >> dbt_test
 
 
 # ── Dimension Refresh (weekly) ────────────────────────────────────────
